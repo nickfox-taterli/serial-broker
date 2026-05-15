@@ -1,6 +1,6 @@
 # serial-broker
 
-`serial-broker` 是我为了解决非常麻烦的无网络Linux板子AI自动化问题做的工具.
+`serial-broker` 是我为了解决非常麻烦的无网络Linux板子AI自动化问题做的工具,该工具大约有70%代码由AI写,并且没有充分review,因此可能有各种问题.
 
 - `serial-broker`:daemon,由人类启动和看护,独占串口,持续记录日志,处理串口事务.
 - `sbctl`:CLI,给 AI/Coding Agent 调用,每次执行一个明确动作.

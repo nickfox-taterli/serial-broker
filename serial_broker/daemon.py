@@ -147,7 +147,8 @@ class Broker:
         if op == "upload":
             method = req.get("method", "zmodem")
             state = "UPLOAD_BASE64" if method == "base64" else "UPLOAD_ZMODEM"
-            return self.with_job(state, op, lambda: self.upload(req["local"], req["remote"], method, float(req.get("timeout", 120))))
+            timeout = self._upload_timeout(req["local"], req.get("timeout"))
+            return self.with_job(state, op, lambda: self.upload(req["local"], req["remote"], method, timeout))
         if op == "reset-board":
             return self.with_job("RESET_BOARD", op, self.reset_board)
         if op == "reset-usb":
@@ -248,15 +249,18 @@ class Broker:
         token = uuid.uuid4().hex
         begin_marker = f"__SB_BEGIN_{token}__"
         end_marker = f"__SB_END_{token}__:"
-        self._write_serial(b"stty -echo 2>/dev/null || true\n")
+        self._write_serial(b"stty -echo 2>/dev/null || true\r")
         time.sleep(0.15)
         seq = self.logs.seq
-        script = (
-            f"printf '%s\\n' {shlex.quote(begin_marker)}\n"
-            f"( {cmd} )\n"
-            "__sb_ec=$?\n"
-            f"printf '%s%s\\n' {shlex.quote(end_marker)} \"$__sb_ec\"\n"
-            "stty echo 2>/dev/null || true\n"
+        script = "\r".join(
+            [
+                f"printf '%s\\n' {shlex.quote(begin_marker)}",
+                f"( {cmd} )",
+                "__sb_ec=$?",
+                f"printf '%s%s\\n' {shlex.quote(end_marker)} \"$__sb_ec\"",
+                "stty echo 2>/dev/null || true",
+                "",
+            ]
         )
         self._write_serial(script.encode("utf-8"))
         ok, text = self._wait_for_regex(re.escape(end_marker) + r"\d+", seq, timeout)
@@ -279,7 +283,7 @@ class Broker:
             time.sleep(min(0.1, remaining))
 
     def send_line(self, text: str, newline: bool = True) -> dict[str, Any]:
-        data = text.encode("utf-8") + (b"\n" if newline else b"")
+        data = text.encode("utf-8") + (b"\r" if newline else b"")
         self._write_serial(data)
         return {"ok": True, "operation": "send", "bytes": len(data)}
 
@@ -308,11 +312,42 @@ class Broker:
         return stripped
 
     def upload(self, local: str, remote: str, method: str, timeout: float) -> dict[str, Any]:
+        shell = self.ensure_target_shell()
+        if not shell.get("ok"):
+            return {
+                "ok": False,
+                "operation": "upload",
+                "method": method,
+                "error": shell["error"],
+                "output": shell.get("output", ""),
+                "suggestion": "target is not at a Linux shell; use sbctl wait/send to reach a shell, or run sbctl reset-usb / sbctl recover --board --usb --wait \"login:\" if the target is stuck",
+            }
         if method == "base64":
             return self.upload_base64(local, remote, timeout)
         if method != "zmodem":
             raise RuntimeError(f"unknown upload method: {method}")
         return self.upload_zmodem(local, remote, timeout)
+
+    def _upload_timeout(self, local: str, requested: Any) -> float:
+        if requested is not None:
+            return float(requested)
+        try:
+            size = os.path.getsize(local)
+        except OSError:
+            return 300.0
+        bytes_per_second = max(self.baud / 12.0, 1.0)
+        return max(300.0, (size / bytes_per_second) + 90.0)
+
+    def ensure_target_shell(self) -> dict[str, Any]:
+        probe = self.run_command("printf SB_SHELL_READY; uname -s", 8)
+        output = probe.get("output", "")
+        if probe.get("ok") and "SB_SHELL_READY" in output and "Linux" in output:
+            return {"ok": True, "output": output}
+        return {
+            "ok": False,
+            "error": "target is not at a working Linux shell",
+            "output": output,
+        }
 
     def _sha256_file(self, path: str) -> str:
         h = hashlib.sha256()
@@ -349,12 +384,47 @@ class Broker:
     def upload_zmodem(self, local: str, remote: str, timeout: float) -> dict[str, Any]:
         local_sha = self._sha256_file(local)
         remote_path = Path(remote)
-        remote_dir = shlex.quote(str(remote_path.parent))
+        remote_dir = str(remote_path.parent)
+        remote_dir_q = shlex.quote(remote_dir)
         basename = remote_path.name
+        basename_q = shlex.quote(basename)
+        remote_tmp_dir = f"/tmp/sbup-{uuid.uuid4().hex[:8]}"
+        remote_tmp_dir_q = shlex.quote(remote_tmp_dir)
+        remote_tmp_path_q = shlex.quote(f"{remote_tmp_dir}/{basename}")
         self.logs.event(f"[UPLOAD_ZMODEM_BEGIN] local={local} remote={remote}")
-        prep = self.run_command(f"mkdir -p {remote_dir} && cd {remote_dir} && rz -y -b -e", 5)
-        if prep.get("ok") is False and prep.get("error") == "timeout":
-            pass
+        probe = self.run_command("command -v rz && command -v sha256sum", 10)
+        if not probe.get("ok"):
+            self.logs.event(f"[UPLOAD_ZMODEM_END] ok=false error=target shell/rz probe failed")
+            return {
+                "ok": False,
+                "operation": "upload",
+                "method": "zmodem",
+                "error": "target is not at a working shell or rz/sha256sum is missing",
+                "output": probe.get("output", ""),
+            }
+        prep = self.run_command(f"mkdir -p {remote_dir_q} {remote_tmp_dir_q}", 20)
+        if not prep.get("ok"):
+            self.logs.event(f"[UPLOAD_ZMODEM_END] ok=false error=mkdir failed")
+            return {
+                "ok": False,
+                "operation": "upload",
+                "method": "zmodem",
+                "error": "failed to create remote directory",
+                "output": prep.get("output", ""),
+            }
+        seq = self.logs.seq
+        self._write_serial(f"cd {remote_tmp_dir_q} && rz -y -b -e\r".encode("utf-8"))
+        ready, ready_text = self._wait_for_regex(r"rz waiting to receive|\*\*\x18B", seq, 15)
+        if not ready:
+            self.logs.event("[UPLOAD_ZMODEM_END] ok=false error=rz did not become ready")
+            self.run_command(f"rm -rf {remote_tmp_dir_q}", 5)
+            return {
+                "ok": False,
+                "operation": "upload",
+                "method": "zmodem",
+                "error": "target rz did not become ready; target may not be at shell",
+                "output": ready_text,
+            }
         send_path = local
         temp_dir = None
         if Path(local).name != basename:
@@ -377,8 +447,43 @@ class Broker:
         if not bridge_ok or sz.returncode not in (0, None):
             err = sz.stderr.read().decode("utf-8", "replace") if sz.stderr else ""
             self.logs.event(f"[UPLOAD_ZMODEM_END] ok=false error={err.strip()}")
+            self.run_command(f"rm -rf {remote_tmp_dir_q}", 5)
             return {"ok": False, "operation": "upload", "method": "zmodem", "error": err or "zmodem failed"}
-        verify = self.run_command(f"sha256sum {shlex.quote(remote)}", 20)
+        tmp_verify = self.run_command(f"cd {remote_tmp_dir_q} && sha256sum {basename_q}", 20)
+        tmp_sha = ""
+        for part in tmp_verify.get("output", "").split():
+            if len(part) == 64:
+                tmp_sha = part
+                break
+        if not tmp_verify.get("ok") or tmp_sha != local_sha:
+            self.run_command(f"rm -rf {remote_tmp_dir_q}", 5)
+            self.logs.event("[UPLOAD_ZMODEM_END] ok=false error=temp sha256 mismatch")
+            return {
+                "ok": False,
+                "operation": "upload",
+                "method": "zmodem",
+                "error": "temporary upload sha256 mismatch",
+                "sha256": local_sha,
+                "remote_sha256": tmp_sha,
+                "size": os.path.getsize(local),
+                "output": tmp_verify.get("output", ""),
+            }
+        move = self.run_command(f"mv -f {remote_tmp_path_q} {remote_dir_q}/", 20)
+        if not move.get("ok"):
+            self.run_command(f"rm -rf {remote_tmp_dir_q}", 5)
+            self.logs.event("[UPLOAD_ZMODEM_END] ok=false error=move failed")
+            return {
+                "ok": False,
+                "operation": "upload",
+                "method": "zmodem",
+                "error": "failed to move uploaded file to remote path",
+                "sha256": local_sha,
+                "remote_sha256": tmp_sha,
+                "size": os.path.getsize(local),
+                "output": move.get("output", ""),
+            }
+        self.run_command(f"rmdir {remote_tmp_dir_q} 2>/dev/null || true", 5)
+        verify = self.run_command(f"cd {remote_dir_q} && sha256sum {basename_q}", 20)
         remote_sha = ""
         for part in verify.get("output", "").split():
             if len(part) == 64:
@@ -437,7 +542,7 @@ class Broker:
             total += written
 
     def reset_board(self) -> dict[str, Any]:
-        audio = Path(__file__).parent / "assets" / "reset-reminder.mp3"
+        audio = Path(__file__).parent / "assets" / "reset-reminder.wav"
         msg = "PLEASE PRESS THE TARGET BOARD RESET BUTTON NOW. Press Enter here after reset is done."
         self.logs.event(f"[RESET_BOARD_BEGIN] audio={audio}")
         if not sys.stdin.isatty():
@@ -492,6 +597,7 @@ class Broker:
             ["mpv", "--no-video", "--really-quiet", str(audio)],
             ["play", "-q", str(audio)],
             ["paplay", str(audio)],
+            ["aplay", "-q", str(audio)],
         ]
         for cmd in candidates:
             if shutil.which(cmd[0]):

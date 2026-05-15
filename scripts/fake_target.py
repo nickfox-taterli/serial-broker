@@ -48,7 +48,7 @@ def main() -> int:
                     break
                 if echo:
                     os.write(master, data.replace(b"\n", b"\r\n"))
-                pending += data
+                pending += data.replace(b"\r", b"\n")
                 while b"\n" in pending:
                     line, pending = pending.split(b"\n", 1)
                     stripped = line.strip()

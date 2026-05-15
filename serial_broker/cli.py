@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     send.add_argument("--no-newline", action="store_true")
     upload = sub.add_parser("upload")
     upload.add_argument("--method", choices=["zmodem", "base64"], default="zmodem")
-    upload.add_argument("--timeout", type=float, default=120)
+    upload.add_argument("--timeout", type=float, default=None)
     upload.add_argument("local")
     upload.add_argument("remote")
     sub.add_parser("reset-board")
@@ -107,7 +107,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "send":
         payload.update(text=args.text, newline=not args.no_newline)
     elif args.cmd == "upload":
-        payload.update(method=args.method, local=args.local, remote=args.remote, timeout=args.timeout)
+        payload.update(method=args.method, local=args.local, remote=args.remote)
+        if args.timeout is not None:
+            payload["timeout"] = args.timeout
     elif args.cmd == "reset-usb":
         payload["timeout"] = args.timeout
     elif args.cmd == "recover":
