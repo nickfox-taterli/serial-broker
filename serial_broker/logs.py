@@ -9,6 +9,12 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
+
+
+def _strip_ansi(line: str) -> str:
+    return _ANSI_ESCAPE.sub("", line)
+
 
 @dataclass
 class LogLine:
@@ -96,7 +102,7 @@ class SerialLogs:
         with self._cond:
             rows = [r for r in self._ring if not self._is_marker_noise(r.text)]
             rows = rows[-max(0, n) :]
-            return [{"seq": r.seq, "ts": r.ts, "text": r.text} for r in rows]
+            return [{"seq": r.seq, "ts": r.ts, "text": _strip_ansi(r.text)} for r in rows]
 
     def _is_marker_noise(self, text: str) -> bool:
         return bool(re.search(r"__SB_(?:BEGIN|END)_[0-9a-fA-F]+__(?::\d+)?", text))
@@ -110,7 +116,7 @@ class SerialLogs:
                         matches.append(line.rstrip("\n"))
             return matches
         with self._cond:
-            return [r.text for r in self._ring if pattern in r.text]
+            return [_strip_ansi(r.text) for r in self._ring if pattern in r.text]
 
     def text_since(self, seq: int) -> str:
         with self._cond:

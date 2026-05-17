@@ -50,6 +50,12 @@ def print_human(resp: dict[str, Any]) -> None:
             bits.append(f"method: {resp.get('method')}")
         if resp.get("sha256"):
             bits.append(f"sha256: {resp.get('sha256')}")
+        est = resp.get("estimate")
+        if est and "error" not in est:
+            bits.append(f"file_size: {est.get('file_size')} bytes")
+            bits.append(f"effective_bps: {est.get('effective_bps')}")
+            bits.append(f"estimated_time: {est.get('estimated_seconds')}s")
+            bits.append(f"note: {est.get('note')}")
         print("\n".join(bits))
 
 
