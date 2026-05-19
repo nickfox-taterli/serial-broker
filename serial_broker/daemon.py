@@ -46,22 +46,14 @@ class Broker:
         self._cancel = threading.Event()
         self._stop = threading.Event()
         self._bridge_active = threading.Event()
-        self._monitor_active = threading.Event()
         self._serial_lock = threading.Lock()
         self.ser: serial.Serial | None = None
         self.reader_thread: threading.Thread | None = None
 
-    def start(self, monitor: bool = False) -> None:
+    def start(self) -> None:
         self._open_serial()
-        if monitor:
-            self._monitor_active.set()
         self.reader_thread = threading.Thread(target=self._reader_loop, name="serial-reader", daemon=True)
         self.reader_thread.start()
-        if monitor:
-            try:
-                self._monitor_loop()
-            finally:
-                self._monitor_active.clear()
         self._serve()
 
     def _open_serial(self) -> None:
@@ -90,7 +82,7 @@ class Broker:
 
     def _reader_loop(self) -> None:
         while not self._stop.is_set():
-            if self._bridge_active.is_set() or self._monitor_active.is_set():
+            if self._bridge_active.is_set():
                 time.sleep(0.02)
                 continue
             ser = self.ser
@@ -104,31 +96,6 @@ class Broker:
             except Exception as exc:
                 self.last_error = str(exc)
                 time.sleep(0.2)
-
-    def _monitor_loop(self) -> None:
-        """实时监视并转发串口数据到 stdout，不显示控制字符/不可见字符。"""
-        ser = self.ser
-        if not ser or not ser.is_open:
-            return
-        stdout = sys.stdout.buffer if hasattr(sys.stdout, "buffer") else sys.stdout
-        while not self._stop.is_set():
-            try:
-                data = ser.read(4096)
-            except Exception as exc:
-                self.last_error = str(exc)
-                break
-            if not data:
-                continue
-            # 写日志（因为 _reader_loop 已退让）
-            self.logs.write_raw(data, text=True)
-            # 只输出可见字符，过滤控制字符（保留换行和制表符）
-            filtered = bytes(
-                b for b in data
-                if b == 0x0A or b == 0x0D or b == 0x09 or (0x20 <= b < 0x7F)
-            )
-            if filtered:
-                stdout.write(filtered)
-                stdout.flush()
 
     def _serve(self) -> None:
         ensure_socket_removed(self.socket_path)
@@ -161,7 +128,12 @@ class Broker:
             except Exception as exc:
                 self.last_error = str(exc)
                 resp = result(ok=False, operation="unknown", state=self.state, error=str(exc))
-            send_json_line(conn, resp)
+            try:
+                send_json_line(conn, resp)
+            except (BrokenPipeError, OSError):
+                # Client disconnected before we could send the response
+                # (e.g. AI killed sbctl mid-operation). Log it but don't crash.
+                self.logs.event("[BROKEN_PIPE] client disconnected before response could be sent")
 
     def dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
         op = req.get("op")
@@ -395,7 +367,7 @@ class Broker:
             size = os.path.getsize(local)
         except OSError:
             return {"error": "cannot stat local file"}
-        effective_bps = max(self.baud * 0.30, 1.0)
+        effective_bps = max(self.baud * 0.30, 1.0) / 8
         estimated_seconds = size / effective_bps
         return {
             "file_size": size,
@@ -763,12 +735,11 @@ def main() -> None:
     parser.add_argument("--socket", default=DEFAULT_SOCKET)
     parser.add_argument("--log-dir", default="./logs")
     parser.add_argument("--ring-lines", type=int, default=2000)
-    parser.add_argument("--monitor", action="store_true", help="实时监视串口数据并转发到stdout(过滤控制字符)")
     args = parser.parse_args()
     broker = Broker(args.serial, args.baud, args.socket, args.log_dir, args.ring_lines)
     signal.signal(signal.SIGTERM, lambda *_: broker._stop.set())
     signal.signal(signal.SIGINT, lambda *_: broker._stop.set())
-    broker.start(monitor=args.monitor)
+    broker.start()
 
 
 if __name__ == "__main__":
